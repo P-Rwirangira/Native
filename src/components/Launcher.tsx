@@ -101,6 +101,26 @@ const formatTime = (dateStr: string) => {
 
 const Launcher: React.FC<LauncherProps> = ({ request, onStartMeeting, onOpenSettings, onOpenProfile, onOpenModes, onPageChange, ollamaPullStatus = 'idle', ollamaPullPercent = 0, ollamaPullMessage = '' }) => {
     const t = useT();
+    // Electron occasionally completes the page load before contextBridge becomes
+    // visible in the main world. The main-process guard also repairs this, but it
+    // deliberately waits four seconds; rendering a fatal-looking error during that
+    // window made a recoverable preload race look like a broken installation.
+    // Recover once here promptly, with a session-scoped cap to prevent reload loops.
+    useEffect(() => {
+        const recoveryKey = 'natively:launcher-preload-reloads';
+        if (window.electronAPI) {
+            try { sessionStorage.removeItem(recoveryKey); } catch { /* storage may be unavailable */ }
+            return;
+        }
+        let attempts = 0;
+        try { attempts = Number(sessionStorage.getItem(recoveryKey) || 0); } catch { /* use zero */ }
+        if (attempts >= 2) return;
+        const timer = window.setTimeout(() => {
+            try { sessionStorage.setItem(recoveryKey, String(attempts + 1)); } catch { /* reload still helps */ }
+            window.location.reload();
+        }, 750);
+        return () => window.clearTimeout(timer);
+    }, []);
     const [meetings, setMeetings] = useState<Meeting[]>([]);
     const [isDetectable, setIsDetectable] = useState(false);
     const [isMeetingActive, setIsMeetingActive] = useState(false);
@@ -169,6 +189,11 @@ const Launcher: React.FC<LauncherProps> = ({ request, onStartMeeting, onOpenSett
     const { isShortcutPressed } = useShortcuts();
     const isLight = useResolvedTheme() === 'light';
     useEffect(() => {
+        // Effects run before the post-hook fallback can return. A document
+        // waiting for its preload bridge must not subscribe yet.
+        const api = window.electronAPI;
+        if (!api) return;
+
         let mounted = true;
         console.log("Launcher mounted");
 
@@ -189,8 +214,8 @@ const Launcher: React.FC<LauncherProps> = ({ request, onStartMeeting, onOpenSett
                 setLaunchCount(newCount);
             }
             // Seed demo data if needed (safe to call always — runs ONCE on mount)
-            if (window.electronAPI && window.electronAPI.seedDemo) {
-                window.electronAPI.seedDemo().catch(err => console.error("Failed to seed demo:", err));
+            if (api.seedDemo) {
+                api.seedDemo().catch(err => console.error("Failed to seed demo:", err));
             }
 
             // Onboarding state — push to orchestrator. The orchestrator handles
@@ -204,8 +229,8 @@ const Launcher: React.FC<LauncherProps> = ({ request, onStartMeeting, onOpenSett
         }
 
         // Sync initial undetectable state
-        if (window.electronAPI?.getUndetectable) {
-            window.electronAPI.getUndetectable().then((undetectable) => {
+        if (api.getUndetectable) {
+            api.getUndetectable().then((undetectable) => {
                 if (mounted) {
                     setIsDetectable(!undetectable);
                     analytics.setUndetectable(undetectable);
@@ -215,8 +240,8 @@ const Launcher: React.FC<LauncherProps> = ({ request, onStartMeeting, onOpenSett
 
         // Listen for undetectable changes
         let removeUndetectableListener: (() => void) | undefined;
-        if (window.electronAPI?.onUndetectableChanged) {
-            removeUndetectableListener = window.electronAPI.onUndetectableChanged((undetectable) => {
+        if (api.onUndetectableChanged) {
+            removeUndetectableListener = api.onUndetectableChanged((undetectable) => {
                 if (mounted) {
                     setIsDetectable(!undetectable);
                     analytics.setUndetectable(undetectable);
@@ -228,23 +253,23 @@ const Launcher: React.FC<LauncherProps> = ({ request, onStartMeeting, onOpenSett
         fetchEvents();
 
         // Sync initial meeting active state — guarded so unmounted component isn't written to
-        if (window.electronAPI?.getMeetingActive) {
-            window.electronAPI.getMeetingActive()
+        if (api.getMeetingActive) {
+            api.getMeetingActive()
                 .then((active) => { if (mounted) setIsMeetingActive(active); })
                 .catch(() => {});
         }
 
         // Listen for meeting state changes (e.g. meeting started/ended from overlay)
         let removeMeetingStateListener: (() => void) | undefined;
-        if (window.electronAPI?.onMeetingStateChanged) {
-            removeMeetingStateListener = window.electronAPI.onMeetingStateChanged(({ isActive }) => {
+        if (api.onMeetingStateChanged) {
+            removeMeetingStateListener = api.onMeetingStateChanged(({ isActive }) => {
                 setIsMeetingActive(isActive);
                 emitOrchestratorEvent({ type: 'meeting:state', isActive });
             });
         }
 
         // Listen for background updates (e.g. after meeting processing finishes)
-        const removeMeetingsListener = window.electronAPI.onMeetingsUpdated(() => {
+        const removeMeetingsListener = api.onMeetingsUpdated?.(() => {
             console.log("Received meetings-updated event");
             fetchMeetings();
         });
@@ -321,22 +346,25 @@ const Launcher: React.FC<LauncherProps> = ({ request, onStartMeeting, onOpenSett
 
     // Separate effect for keyboard listener — re-registers when isShortcutPressed changes
     useEffect(() => {
+        const api = window.electronAPI;
+        if (!api) return;
+
         const handleKeyDown = (e: KeyboardEvent) => {
             if (isShortcutPressed(e, 'toggleVisibility')) {
                 e.preventDefault();
-                window.electronAPI.toggleWindow();
+                api.toggleWindow();
             } else if (isShortcutPressed(e, 'moveWindowUp')) {
                 e.preventDefault();
-                window.electronAPI.moveWindowUp?.();
+                api.moveWindowUp?.();
             } else if (isShortcutPressed(e, 'moveWindowDown')) {
                 e.preventDefault();
-                window.electronAPI.moveWindowDown?.();
+                api.moveWindowDown?.();
             } else if (isShortcutPressed(e, 'moveWindowLeft')) {
                 e.preventDefault();
-                window.electronAPI.moveWindowLeft?.();
+                api.moveWindowLeft?.();
             } else if (isShortcutPressed(e, 'moveWindowRight')) {
                 e.preventDefault();
-                window.electronAPI.moveWindowRight?.();
+                api.moveWindowRight?.();
             }
         };
         window.addEventListener('keydown', handleKeyDown);
@@ -626,7 +654,7 @@ const Launcher: React.FC<LauncherProps> = ({ request, onStartMeeting, onOpenSett
 
     // After every hook: an early return above them would change the hook count between renders.
     if (!window.electronAPI) {
-        return <div className="text-white p-10">Error: Electron API not initialized. Check preload script.</div>;
+        return <div className="h-full w-full flex items-center justify-center bg-bg-primary text-text-secondary">Connecting to Nativelyâ€¦</div>;
     }
 
     return (

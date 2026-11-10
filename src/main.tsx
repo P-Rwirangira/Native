@@ -39,6 +39,31 @@ if (launcherIsolation === 'shell') {
 
 // Set platform attribute synchronously — before React renders — so CSS selectors
 // like html[data-platform="win32"] work immediately without a flash on first paint.
+// App-owned Electron windows require the preload bridge. Electron can
+// occasionally finish a navigation without running preload (the main-process
+// preloadBridgeGuard detects this and reloads the page). Do not mount React in
+// that dead interval: mounting turns a recoverable preload miss into an
+// error-boundary crash such as "reading 'getCanAutoUpdate' of undefined".
+const electronWindowRoute = new URLSearchParams(window.location.search).get('window');
+if (electronWindowRoute && !window.electronAPI) {
+  // eslint-disable-next-line no-console
+  console.error(`[renderer] PRELOAD-BRIDGE-MISSING before mount (route=${electronWindowRoute}); waiting for main-process reload`);
+  const rootEl = document.getElementById('root');
+  const silentRoute = ['overlay', 'overlay-pill', 'overlay-toggle', 'cropper'].includes(electronWindowRoute);
+  if (rootEl && !silentRoute) {
+    const recovery = document.createElement('div');
+    recovery.style.cssText = 'min-height:100vh;display:grid;place-content:center;gap:12px;text-align:center;color:#eee;background:#0b0b0d;font:14px Inter,system-ui,sans-serif';
+    const status = document.createElement('div');
+    status.textContent = 'Recovering the app connection…';
+    const reload = document.createElement('button');
+    reload.type = 'button';
+    reload.textContent = 'Reload now';
+    reload.style.cssText = 'justify-self:center;border:1px solid #555;border-radius:8px;padding:8px 14px;color:#fff;background:#242428;cursor:pointer';
+    reload.addEventListener('click', () => window.location.reload());
+    recovery.append(status, reload);
+    rootEl.replaceChildren(recovery);
+  }
+} else {
 document.documentElement.setAttribute(
   'data-platform',
   window.electronAPI?.platform ?? (typeof process !== 'undefined' ? process.platform : '') ?? ''
@@ -165,5 +190,6 @@ try {
   // Log it so the failure has a trace in natively_debug.log instead of nothing.
   // eslint-disable-next-line no-console
   console.error('[renderer] FATAL: React mount threw', err?.stack ?? err?.message ?? String(err));
+}
 }
 }

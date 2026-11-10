@@ -12,11 +12,13 @@
 // Vite reloaded the page, so a reload is what heals it. Whether a packaged
 // build can hit it is not known.
 //
-// The check does not ask the page: in the broken state the renderer's IPC
-// bridge is what is missing, so executeJavaScript cannot be trusted to answer.
-// Instead the preload reports in on PRELOAD_READY_CHANNEL every time it runs,
-// and a page that finished loading without a report since its load began is
-// reloaded, at most PRELOAD_GUARD_MAX_RELOADS times.
+// The preload reports in on PRELOAD_READY_CHANNEL every time it runs. That
+// report is necessary but not sufficient: Electron can execute the isolated
+// preload world and deliver IPC while failing to publish the contextBridge
+// object into the page's main world. Therefore the guard also asks the loaded
+// page whether the exposed API and one representative function are visible.
+// A disagreement is treated exactly like a missing report and gets the same
+// bounded reload recovery.
 //
 // Shared code: the same webContents and ipcMain calls on macOS and Windows.
 
@@ -93,6 +95,7 @@ export function guardPreloadBridge(
 
 type GuardedContents = PreloadGuardTarget & {
   on(event: 'did-start-navigation' | 'did-finish-load' | 'destroyed', listener: (...args: any[]) => void): unknown;
+  executeJavaScript?(code: string, userGesture?: boolean): Promise<unknown>;
 };
 
 /** Guards every load of this window. Call right after creating it. */
@@ -115,7 +118,28 @@ export function attachPreloadBridgeGuard(
       if (main && !sameDocument) markLoadStarted(id);
     });
     wc.on('did-finish-load', () => {
-      setTimeout(() => { guardPreloadBridge(wc, tag, opts.log); }, opts.waitMs ?? PRELOAD_GUARD_WAIT_MS);
+      setTimeout(async () => {
+        if (wc.isDestroyed()) return;
+        const started = loadStartedAt.get(id) ?? 0;
+        if (typeof wc.executeJavaScript === 'function' && /[?&]window=/.test(wc.getURL())) {
+          try {
+            const visible = await wc.executeJavaScript(
+              `Boolean(window.electronAPI && typeof window.electronAPI === 'object' && typeof window.electronAPI.onMeetingsUpdated === 'function')`,
+            );
+            // Ignore an answer from a document superseded while the async main-
+            // world check was in flight.
+            if ((loadStartedAt.get(id) ?? 0) !== started || wc.isDestroyed()) return;
+            if (visible !== true) {
+              readyAt.delete(id);
+              opts.log?.(`[Renderer:${tag}] PRELOAD-BRIDGE-MAIN-WORLD-MISSING despite preload report`);
+            }
+          } catch {
+            // The report-based guard remains the fallback when Chromium cannot
+            // evaluate the page (for example, teardown during app quit).
+          }
+        }
+        guardPreloadBridge(wc, tag, opts.log);
+      }, opts.waitMs ?? PRELOAD_GUARD_WAIT_MS);
     });
     wc.on('destroyed', () => { readyAt.delete(id); loadStartedAt.delete(id); reloadsById.delete(id); });
   } catch { /* a window torn down mid-construction */ }

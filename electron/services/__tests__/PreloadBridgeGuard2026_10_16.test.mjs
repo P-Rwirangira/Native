@@ -22,10 +22,11 @@ cjs.cache[cjs.resolve('electron')] = electronStub;
 const guard = cjs(path.join(root, 'dist-electron/electron/preloadBridgeGuard.js'));
 
 let nextId = 1;
-function fakeWindow(url = 'http://127.0.0.1:5173/?window=launcher') {
+function fakeWindow(url = 'http://127.0.0.1:5173/?window=launcher', mainWorldReady = true) {
   const handlers = {};
   const wc = { id: nextId++, reloads: 0, destroyed: false, getURL: () => url, isDestroyed: () => wc.destroyed,
-    reloadIgnoringCache: () => { wc.reloads++; }, on: (ev, fn) => { handlers[ev] = fn; } };
+    reloadIgnoringCache: () => { wc.reloads++; }, on: (ev, fn) => { handlers[ev] = fn; },
+    executeJavaScript: async () => mainWorldReady };
   return { win: { webContents: wc }, wc, emit: (ev, ...a) => handlers[ev]?.(...a) };
 }
 const silent = () => {};
@@ -39,6 +40,16 @@ test('a page whose preload reported in is left alone', async () => {
   navigate(w); await sleep(2); report(w.wc); w.emit('did-finish-load');
   await sleep(20);
   assert.equal(w.wc.reloads, 0);
+});
+
+test('a preload report does not count when the API is absent from the main world', async () => {
+  const w = fakeWindow('http://127.0.0.1:5173/?window=launcher', false);
+  const logs = [];
+  guard.attachPreloadBridgeGuard(w.win, 'launcher', { waitMs: 5, log: (m) => logs.push(m) });
+  navigate(w); await sleep(2); report(w.wc); w.emit('did-finish-load');
+  await sleep(20);
+  assert.equal(w.wc.reloads, 1);
+  assert.match(logs.join('\n'), /MAIN-WORLD-MISSING/);
 });
 
 test('a page that loaded without a report is reloaded, and stops once it reports', async () => {

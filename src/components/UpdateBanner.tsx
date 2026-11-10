@@ -35,8 +35,10 @@ const UpdateBanner: React.FC = () => {
     const [minimized, setMinimized] = useState(false);
 
     useEffect(() => {
+        const api = window.electronAPI;
+        if (!api) return;
         let cancelled = false;
-        window.electronAPI.getCanAutoUpdate?.()
+        api.getCanAutoUpdate?.()
             .then(({ canAutoUpdate }) => { if (!cancelled) setCanAutoUpdate(canAutoUpdate); })
             .catch((err) => {
                 if (cancelled) return;
@@ -47,8 +49,10 @@ const UpdateBanner: React.FC = () => {
     }, []);
 
     useEffect(() => {
+        const api = window.electronAPI;
+        if (!api) return;
         // Listen for update available
-        const unsubAvailable = window.electronAPI.onUpdateAvailable((info: UpdateInfo) => {
+        const unsubAvailable = api.onUpdateAvailable((info: UpdateInfo) => {
             console.log('[UpdateBanner] Update available:', info);
             setUpdateInfo(info);
             setErrorMessage(null);
@@ -64,7 +68,7 @@ const UpdateBanner: React.FC = () => {
         });
 
         // Listen for download progress
-        const unsubProgress = window.electronAPI.onDownloadProgress((progressObj) => {
+        const unsubProgress = api.onDownloadProgress((progressObj) => {
             // Re-show toast only if user hasn't explicitly dismissed it
             if (!userDismissedRef.current) {
                 setIsVisible(true);
@@ -79,7 +83,7 @@ const UpdateBanner: React.FC = () => {
         });
 
         // Listen for update-downloaded event
-        const unsubDownloaded = window.electronAPI.onUpdateDownloaded((info) => {
+        const unsubDownloaded = api.onUpdateDownloaded((info) => {
             console.log('[UpdateBanner] Update downloaded:', info);
             setUpdateInfo(info); // Update info again just in case
             if (info.parsedNotes) setParsedNotes(info.parsedNotes);
@@ -97,7 +101,7 @@ const UpdateBanner: React.FC = () => {
         });
 
         // Listen for update errors
-        const unsubError = window.electronAPI.onUpdateError((err: string) => {
+        const unsubError = api.onUpdateError((err: string) => {
             console.error('[UpdateBanner] Update error:', err);
             setStatus('error');
             setErrorMessage(err);
