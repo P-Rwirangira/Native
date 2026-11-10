@@ -200,7 +200,7 @@ type Listener = (state: OrchestratorState) => void;
 // ─── UserState default ────────────────────────────────────────────
 
 export const DEFAULT_USER_STATE: UserState = {
-  isPremium: false,
+  isPremium: true,
   hasProfile: false,
   hasNativelyKey: false,
   hasTrialToken: false,

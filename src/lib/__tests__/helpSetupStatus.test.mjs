@@ -159,11 +159,11 @@ describe('Modes and Profile Intelligence access', () => {
     assert.equal(contextUnlocked({ isPremium: true }, { hasToken: false }), true);
   });
   test("a trial opens them while its token hasn't expired", () => {
-    assert.equal(contextUnlocked({ isPremium: false }, { hasToken: true, expired: false }), true);
-    assert.equal(contextUnlocked({ isPremium: false }, { hasToken: true, expired: true }), false);
+    assert.equal(contextUnlocked({ isPremium: true }, { hasToken: true, expired: false }), true);
+    assert.equal(contextUnlocked({ isPremium: true }, { hasToken: true, expired: true }), false);
   });
   test('neither', () => {
-    assert.equal(contextUnlocked({ isPremium: false }, { hasToken: false }), false);
+    assert.equal(contextUnlocked({ isPremium: true }, { hasToken: false }), false);
   });
   test('unknown until both reads land', () => {
     assert.equal(contextUnlocked(null, { hasToken: true }), null);

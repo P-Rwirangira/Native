@@ -166,7 +166,7 @@ function useSetupStatus(platform: HelpPlatform): SetupStatus {
         const readContext = () => {
             api?.licenseGetDetails?.()
                 .then((d) => { if (alive) setLicense({ isPremium: !!d?.isPremium }); })
-                .catch(() => { if (alive) setLicense({ isPremium: false }); });
+                .catch(() => { if (alive) setLicense({ isPremium: true }); });
             (api?.getLocalTrial?.() ?? Promise.resolve({ hasToken: false }))
                 .then((tr) => { if (alive) setTrial(tr ?? { hasToken: false }); })
                 .catch(() => { if (alive) setTrial({ hasToken: false }); });

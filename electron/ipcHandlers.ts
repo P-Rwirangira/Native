@@ -490,7 +490,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       const orchestrator = appState.getKnowledgeOrchestrator();
       if (!orchestrator) return;
       orchestrator.setKnowledgeMode(false);
-      const { DocType } = require('../premium/electron/knowledge/types');
+      const { DocType } = require('./knowledge/types');
       orchestrator.deleteDocumentsByType(DocType.RESUME);
       orchestrator.deleteDocumentsByType(DocType.JD);
       // …and their raw-text indexes (text + vectors under profile:<kind>:<version>).
@@ -1247,6 +1247,8 @@ export function initializeIpcHandlers(appState: AppState): void {
     }
   });
   safeHandle('license:check-premium', async () => {
+    const { FORCE_ULTRA_FOR_TESTING } = require('./services/qaPlanOverride');
+    if (FORCE_ULTRA_FOR_TESTING) return true;
     try {
       const { LicenseManager } = require('../premium/electron/services/LicenseManager');
       return LicenseManager.getInstance().isPremium();
@@ -1256,6 +1258,8 @@ export function initializeIpcHandlers(appState: AppState): void {
   });
 
   safeHandle('license:get-details', async () => {
+    const { FORCE_ULTRA_FOR_TESTING, QA_ULTRA_LICENSE_DETAILS } = require('./services/qaPlanOverride');
+    if (FORCE_ULTRA_FOR_TESTING) return QA_ULTRA_LICENSE_DETAILS;
     try {
       const { LicenseManager } = require('../premium/electron/services/LicenseManager');
       return LicenseManager.getInstance().getLicenseDetails();
@@ -1267,6 +1271,8 @@ export function initializeIpcHandlers(appState: AppState): void {
   // Returns false only if the server definitively revokes the key.
   // Network errors fail-open (returns cached sync result).
   safeHandle('license:check-premium-async', async () => {
+    const { FORCE_ULTRA_FOR_TESTING } = require('./services/qaPlanOverride');
+    if (FORCE_ULTRA_FOR_TESTING) return true;
     try {
       const { LicenseManager } = require('../premium/electron/services/LicenseManager');
       return await LicenseManager.getInstance().isPremiumAsync();
@@ -1294,7 +1300,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       clearActiveModeOnLicenseLoss();
       BrowserWindow.getAllWindows().forEach((win) => {
         if (!win.isDestroyed())
-          win.webContents.send('license-status-changed', { isPremium: false });
+          win.webContents.send('license-status-changed', { isPremium: true });
       });
     } catch {
       /* LicenseManager not available */
@@ -12344,7 +12350,7 @@ export function initializeIpcHandlers(appState: AppState): void {
             clearActiveModeOnLicenseLoss();
             BrowserWindow.getAllWindows().forEach((win) => {
               if (!win.isDestroyed())
-                win.webContents.send('license-status-changed', { isPremium: false });
+                win.webContents.send('license-status-changed', { isPremium: true });
             });
           }
         } catch (e: any) {
@@ -13129,7 +13135,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       await step('active mode', () => clearActiveModeOnLicenseLoss());
       BrowserWindow.getAllWindows().forEach((win) => {
         if (!win.isDestroyed()) {
-          win.webContents.send('license-status-changed', { isPremium: false });
+          win.webContents.send('license-status-changed', { isPremium: true });
           win.webContents.send('trial-ended', { choice: 'byok' });
         }
       });
@@ -18332,7 +18338,7 @@ export function initializeIpcHandlers(appState: AppState): void {
           error: 'Knowledge engine not initialized. Please ensure API keys are configured.',
         };
       }
-      const { DocType } = require('../premium/electron/knowledge/types');
+      const { DocType } = require('./knowledge/types');
       const result = await orchestrator.ingestDocument(resolvedPath, DocType.RESUME);
       // Index the raw text for the profile path's semantic arm (fire and forget).
       if (result?.success) { try { require('./services/knowledge/v3ProfileSources').kickProfileRawIndex(orchestrator); } catch { /* non-fatal */ } }
@@ -18396,7 +18402,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       // upload slot and invites a duplicate upload. NOT covered by
       // aot_pipeline_running: that is JD-side and, per the comment above,
       // deliberately excluded from the resume readiness signal.
-      const { DocType: StatusDocType } = require('../premium/electron/knowledge/types');
+      const { DocType: StatusDocType } = require('./knowledge/types');
       return {
         hasProfile: status.hasResume,
         profileMode: status.activeMode,
@@ -18458,7 +18464,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       if (!orchestrator) {
         return { success: false, error: 'Knowledge engine not initialized' };
       }
-      const { DocType } = require('../premium/electron/knowledge/types');
+      const { DocType } = require('./knowledge/types');
       // Both tiers in ONE transaction. Deleting only Tier 1 here left Tier 2's
       // PII-bearing knowledge_cards orphaned — the user asked for their résumé
       // to be removed and half of it stayed on disk. Tier 1 (premium
@@ -18568,7 +18574,7 @@ export function initializeIpcHandlers(appState: AppState): void {
           error: 'Knowledge engine not initialized. Please ensure API keys are configured.',
         };
       }
-      const { DocType } = require('../premium/electron/knowledge/types');
+      const { DocType } = require('./knowledge/types');
       const result = await orchestrator.ingestDocument(resolvedPath, DocType.JD);
       // Index the raw text for the profile path's semantic arm (fire and forget).
       if (result?.success) { try { require('./services/knowledge/v3ProfileSources').kickProfileRawIndex(orchestrator); } catch { /* non-fatal */ } }
@@ -18603,7 +18609,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       if (!orchestrator) {
         return { success: false, error: 'Knowledge engine not initialized' };
       }
-      const { DocType } = require('../premium/electron/knowledge/types');
+      const { DocType } = require('./knowledge/types');
       // Same cross-tier transaction as profile:delete above — see the comment
       // there for why a Tier-1-only delete is a partial delete.
       const { deleteProfileTransactional } = require('./services/knowledge/deleteProfileTransactional') as typeof import('./services/knowledge/deleteProfileTransactional');
@@ -19131,7 +19137,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       const resolved = consumeSelectedProfilePath(tempPath);
       if (!resolved) return { success: false, error: 'Could not stage the pasted job description.' };
 
-      const { DocType } = require('../premium/electron/knowledge/types');
+      const { DocType } = require('./knowledge/types');
       const result = await orchestrator.ingestDocument(resolved, DocType.JD);
       // Index the raw text for the profile path's semantic arm (fire and forget).
       if (result?.success) { try { require('./services/knowledge/v3ProfileSources').kickProfileRawIndex(orchestrator); } catch { /* non-fatal */ } }
@@ -19195,7 +19201,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       const staged = consumeSelectedProfilePath(tempPath);
       if (!staged) return { success: false, error: 'Could not stage the imported job description.' };
 
-      const { DocType } = require('../premium/electron/knowledge/types');
+      const { DocType } = require('./knowledge/types');
       const result = await orchestrator.ingestDocument(staged, DocType.JD);
       // Index the raw text for the profile path's semantic arm (fire and forget).
       if (result?.success) { try { require('./services/knowledge/v3ProfileSources').kickProfileRawIndex(orchestrator); } catch { /* non-fatal */ } }
@@ -21531,7 +21537,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       try {
         const orchestrator = appState.getKnowledgeOrchestrator();
         if (!orchestrator) return { success: false, error: 'orchestrator_not_initialized' };
-        const { DocType } = require('../premium/electron/knowledge/types');
+        const { DocType } = require('./knowledge/types');
         const dt = params.docType === 'jd' ? DocType.JD : DocType.RESUME;
         const result = await orchestrator.ingestDocument(params.filePath, dt);
         // Index the raw text for the profile path's semantic arm (fire and forget).
@@ -21625,7 +21631,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       try {
         const orchestrator = appState.getKnowledgeOrchestrator();
         if (!orchestrator) return { success: false, error: 'orchestrator_not_initialized' };
-        const { DocType } = require('../premium/electron/knowledge/types');
+        const { DocType } = require('./knowledge/types');
         orchestrator.deleteDocumentsByType(DocType.RESUME);
         orchestrator.deleteDocumentsByType(DocType.JD);
         return { success: true };

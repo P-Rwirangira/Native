@@ -208,6 +208,10 @@ export const PLANS = [
   },
 ] as const;
 
+// Temporary QA override: set to false before shipping.
+const FORCE_ULTRA_FOR_TESTING = true;
+const DEFAULT_PLAN_ID = 'natively_api_ultra_monthly';
+
 // Picks a glyph for a feature row from the feature's OWN wording. The
 // references all use characterful, varied icons rather than one repeated
 // tick, and a per-row icon is what stops a feature list reading as a generic
@@ -759,8 +763,8 @@ export const NativelyApiSettings: React.FC<NativelyApiSettingsProps> = ({ initia
   const [usageData, setUsageData] = useState<UsageData | null>(() => usageCache);
   const [isLoadingUsage, setIsLoadingUsage] = useState(false);
   const [planCatalog, setPlanCatalog] = useState<Record<string, NativelyPlanLimits> | null>(null);
-  const [selectedPlanId, setSelectedPlanId] = useState<string>('natively_api_pro_monthly');
-  const [prevPlanId, setPrevPlanId] = useState<string>('natively_api_pro_monthly');
+  const [selectedPlanId, setSelectedPlanId] = useState<string>(DEFAULT_PLAN_ID);
+  const [prevPlanId, setPrevPlanId] = useState<string>(DEFAULT_PLAN_ID);
   // Selection is purely manual now — the tier selector used to auto-rotate
   // through Standard/Pro/Max/Ultra every 4.5s via setInterval, which reads
   // fine as a marketing carousel but fights a "calm once loaded" settings
@@ -776,6 +780,10 @@ export const NativelyApiSettings: React.FC<NativelyApiSettingsProps> = ({ initia
   }, []);
 
   useEffect(() => {
+    if (FORCE_ULTRA_FOR_TESTING) {
+      selectPlan(DEFAULT_PLAN_ID);
+      return;
+    }
     if (usageData?.plan) {
       const planName = usageData.plan.toLowerCase();
       if (planName === 'starter' || planName === 'standard') {

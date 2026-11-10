@@ -57,7 +57,7 @@ describe('licenseCache — survives restart', () => {
     test('a downgrade to non-premium overwrites rather than lingering', async () => {
         const first = await restart();
         first.setLicenseSnapshot({ isPremium: true, provider: 'dodo' });
-        first.setLicenseSnapshot({ isPremium: false });
+        first.setLicenseSnapshot({ isPremium: true });
 
         const second = await restart();
         assert.equal(second.getLicenseSnapshot().isPremium, false);

@@ -1415,7 +1415,9 @@ try {
     KnowledgeDatabaseManagerClass = require('../premium/electron/knowledge/KnowledgeDatabaseManager').KnowledgeDatabaseManager;
     textHasCompEvidence = require('../premium/electron/knowledge/NegotiationConversationTracker').textHasCompEvidence;
 } catch {
-    console.log('[Main] Knowledge modules not available — profile intelligence disabled.');
+    KnowledgeOrchestratorClass = require('./knowledge/CoreKnowledgeOrchestrator').CoreKnowledgeOrchestrator;
+    KnowledgeDatabaseManagerClass = require('./knowledge/CoreKnowledgeDatabaseManager').CoreKnowledgeDatabaseManager;
+    console.log('[Main] Premium knowledge module unavailable - core profile context enabled.');
 }
 
 import { CredentialsManager } from "./services/CredentialsManager"
@@ -10710,6 +10712,29 @@ async function initializeApp() {
   logStartupPhase('credentials-init:start');
   const { CredentialsManager } = require('./services/CredentialsManager');
   CredentialsManager.getInstance().init();
+
+  // Development convenience: a Groq key supplied through .env should be
+  // enough to make answers, the model picker, and transcription agree. The
+  // runtime helper can read process.env directly, but the renderer reads the
+  // persisted credential/default-model state, so hydrate both here.
+  if (!app.isPackaged) {
+    const groqEnvKey = process.env.GROQ_API_KEY?.trim();
+    const credentials = CredentialsManager.getInstance();
+    if (groqEnvKey) {
+      const { GROQ_PRIMARY_MODEL } = require('./llm/groqModels');
+      credentials.setGroqApiKey(groqEnvKey);
+      credentials.setPreferredModel('groq', GROQ_PRIMARY_MODEL);
+      credentials.setDefaultModel(GROQ_PRIMARY_MODEL);
+
+      // Keep an explicit non-empty speech-provider choice authoritative.
+      if (credentials.getSttProvider() === 'none') {
+        credentials.setGroqSttApiKey(groqEnvKey);
+        credentials.setGroqSttModel('whisper-large-v3-turbo');
+        credentials.setSttProvider('groq');
+      }
+      console.log(`[Init] Groq enabled from GROQ_API_KEY (${GROQ_PRIMARY_MODEL}; whisper-large-v3-turbo).`);
+    }
+  }
   logStartupPhase('credentials-init:complete');
 
   // 4. Initialize State

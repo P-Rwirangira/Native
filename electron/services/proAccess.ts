@@ -3,6 +3,7 @@
 // handler (the meeting notes reading "About you") asks the same question.
 // No platform branches: LicenseManager and CredentialsManager hide their
 // macOS / Windows storage differences behind these calls.
+import { FORCE_ULTRA_FOR_TESTING } from './qaPlanOverride';
 
 /**
  * Returns true if the user has an active premium license OR an unexpired free trial.
@@ -10,6 +11,8 @@
  * research, Cue Cards, "About you").
  */
 export function isProOrTrialActive(): boolean {
+  if (FORCE_ULTRA_FOR_TESTING) return true;
+
   // 1. Full premium license (Dodo / Gumroad / Natively API subscription)
   try {
     const { LicenseManager } = require('../../premium/electron/services/LicenseManager');

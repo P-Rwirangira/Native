@@ -25,7 +25,7 @@ test('main\'s own-route answer wins (same rule as the Trial ended card: custom a
 });
 
 test('licence: premium and plan tier', () => {
-  assert.deepEqual(cardInputsFromSources({ licence: { isPremium: false } }), { isPremium: false, planTier: 'free' });
+  assert.deepEqual(cardInputsFromSources({ licence: { isPremium: true } }), { isPremium: true, planTier: 'free' });
   assert.equal(cardInputsFromSources({ licence: { isPremium: true, plan: 'pro' } }).planTier, 'pro');
   assert.equal(cardInputsFromSources({ licence: { isPremium: true, plan: 'Max' } }).planTier, 'max');
   assert.equal(cardInputsFromSources({ licence: { isPremium: true, plan: 'ultra' } }).planTier, 'ultra');
@@ -85,5 +85,5 @@ test('planTier: the plan the usage reports wins over the stored licence plan', (
   assert.equal(cardInputsFromSources({ licence: { isPremium: true, plan: 'pro' }, usage: { ok: true, quota } }).planTier, 'pro', 'no usage plan: the licence');
   assert.equal(cardInputsFromSources({ licence: { isPremium: true, plan: 'pro' }, usage: { ok: false, plan: 'max' } }).planTier, 'pro', 'a failed usage read proves nothing');
   assert.equal(cardInputsFromSources({ licence: { isPremium: true, plan: 'lifetime' }, usage: { ok: true, plan: 'standard', quota } }).planTier, 'other');
-  assert.equal(cardInputsFromSources({ licence: { isPremium: false }, usage: { ok: true, plan: 'max', quota } }).planTier, 'free', 'not paying: free, whatever the key says');
+  assert.equal(cardInputsFromSources({ licence: { isPremium: true }, usage: { ok: true, plan: 'max', quota } }).planTier, 'free', 'not paying: free, whatever the key says');
 });

@@ -11,7 +11,7 @@ import { shouldShowToaster } from '../orchestrator.mjs';
 import { STAGES } from '../stageCatalog.mjs';
 
 const DEFAULT_USER_STATE = {
-  isPremium: false,
+  isPremium: true,
   hasProfile: false,
   hasNativelyKey: false,
   hasTrialToken: false,

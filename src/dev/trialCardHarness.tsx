@@ -71,7 +71,7 @@ const OVERRIDES: Record<string, () => Promise<any>> = {
     : { ok: false }),
   getNativelyUsage: async () => null,
   getNativelyPlans: async () => null,
-  getLicenseDetails: async () => ({ isPremium: false }),
+  getLicenseDetails: async () => ({ isPremium: true }),
 };
 
 (window as any).electronAPI = new Proxy({}, {

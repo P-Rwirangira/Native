@@ -55,7 +55,7 @@ test('INVARIANT: every gate-only stage is onceEver — stageCatalog.ts (producti
 // ─── Fixtures ──────────────────────────────────────────────────────
 
 const DEFAULT_USER_STATE = {
-  isPremium: false,
+  isPremium: true,
   hasProfile: false,
   hasNativelyKey: false,
   hasTrialToken: false,

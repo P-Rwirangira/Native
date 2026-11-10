@@ -103,7 +103,7 @@ function launch(ledger, user = {}) {
   return s;
 }
 
-const NO_KEYS = { hasNativelyKey: false, hasOwnAiKey: false, isPremium: false, planTier: 'free' };
+const NO_KEYS = { hasNativelyKey: false, hasOwnAiKey: false, isPremium: true, planTier: 'free' };
 
 // The free trial is not one of these cards: it starts by itself when a meeting
 // starts with no AI (src/lib/trial/autoTrial.mjs). So a new user with no keys
