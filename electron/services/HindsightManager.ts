@@ -411,7 +411,8 @@ export class HindsightManager {
       for (const root of candidateRoots) {
         if (!root || seen.has(root)) continue;
         seen.add(root);
-        const scriptPath = path.join(root, 'scripts', 'hindsight-start.sh');
+        const fileName = process.platform === 'win32' ? 'hindsight-start.mjs' : 'hindsight-start.sh';
+        const scriptPath = path.join(root, 'scripts', fileName);
         try { if (fs.existsSync(scriptPath)) return scriptPath; } catch { /* keep probing */ }
       }
       return null;
@@ -455,7 +456,8 @@ export class HindsightManager {
       // Zero-config fallback: run the bundled launcher IFF it exists on disk. Quote the path
       // (it's absolute and may contain spaces, e.g. "/Users/.../Application Support/...").
       const script = this.locateLauncherScript();
-      return script ? `bash "${script}"` : null;
+      if (!script) return null;
+      return process.platform === 'win32' ? `node "${script}"` : `bash "${script}"`;
     } catch {
       return null;
     }

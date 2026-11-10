@@ -5,7 +5,7 @@
 // Usage:  HINDSIGHT_BASE_URL=http://localhost:8888 node scripts/hindsight-smoke-test.mjs
 import { HindsightClient } from '@vectorize-io/hindsight-client';
 
-const baseUrl = process.env.HINDSIGHT_BASE_URL || 'http://localhost:8888';
+const baseUrl = process.env.HINDSIGHT_BASE_URL || 'http://127.0.0.1:8888';
 const client = new HindsightClient({ baseUrl });
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -41,11 +41,19 @@ async function main() {
 
   // 3. Isolation: Bob's bank must NOT see Alice's fact.
   console.log('[smoke] recall ← Bob bank (isolation check)...');
-  const bobRes = await client.recall(bankB, 'Where does Alice work?', {
-    tags: ['user:bob', 'visibility:private'],
-    tagsMatch: 'all_strict',
-    maxTokens: 1024,
-  });
+  let bobRes;
+  try {
+    bobRes = await client.recall(bankB, 'Where does Alice work?', {
+      tags: ['user:bob', 'visibility:private'],
+      tagsMatch: 'all_strict',
+      maxTokens: 1024,
+    });
+  } catch (error) {
+    // Banks are created on first retain. A missing foreign bank is the strongest
+    // possible isolation result, not a smoke-test failure.
+    if (error?.statusCode !== 404) throw error;
+    bobRes = { results: [] };
+  }
   const bobTexts = (bobRes?.results || []).map((r) => String(r.text));
   const leaked = bobTexts.some((t) => /google|redis|alice/i.test(t));
   console.log(`[smoke] Bob recall returned ${bobTexts.length} result(s); leaked Alice data: ${leaked ? 'YES ❌' : 'NO ✅'}`);
@@ -53,15 +61,15 @@ async function main() {
   // Verdict.
   if (found && !leaked) {
     console.log('\n[smoke] ✅ PASS — retain→recall works and bank isolation holds.');
-    process.exit(0);
+    process.exitCode = 0;
   } else {
     console.log('\n[smoke] ❌ FAIL — see results above.');
-    process.exit(1);
+    process.exitCode = 1;
   }
 }
 
 main().catch((e) => {
   console.error('[smoke] ERROR:', e?.message || e);
   if (e?.statusCode) console.error('[smoke] HTTP status:', e.statusCode);
-  process.exit(2);
+  process.exitCode = 2;
 });

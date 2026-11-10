@@ -26,21 +26,46 @@ PORT = int(os.environ.get("HINDSIGHT_PORT", "8888"))
 
 # Provider + key. Gemini is supported by the Hindsight server; the app already has
 # GEMINI_API_KEY. Fall back to other common keys if a different provider is preferred.
-PROVIDER = os.environ.get("HINDSIGHT_LLM_PROVIDER", "gemini")
+if os.environ.get("HINDSIGHT_LLM_PROVIDER"):
+    PROVIDER = os.environ["HINDSIGHT_LLM_PROVIDER"]
+elif os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
+    PROVIDER = "gemini"
+elif os.environ.get("OPENAI_API_KEY"):
+    PROVIDER = "openai"
+elif os.environ.get("GROQ_API_KEY"):
+    PROVIDER = "groq"
+else:
+    PROVIDER = "gemini"
 API_KEY = (
     os.environ.get("HINDSIGHT_API_LLM_API_KEY")
     or os.environ.get("GEMINI_API_KEY")
     or os.environ.get("GOOGLE_API_KEY")
     or os.environ.get("OPENAI_API_KEY")
+    or os.environ.get("GROQ_API_KEY")
 )
 # A sensible default Gemini model; override via HINDSIGHT_LLM_MODEL if the server
 # rejects it (the smoke test will surface that).
-MODEL = os.environ.get("HINDSIGHT_LLM_MODEL", "gemini-2.5-flash")
+DEFAULT_MODELS = {
+    "gemini": "gemini-2.5-flash",
+    "openai": "gpt-4.1-mini",
+    "groq": "qwen/qwen3.8-27b",
+}
+MODEL = os.environ.get("HINDSIGHT_LLM_MODEL", DEFAULT_MODELS.get(PROVIDER, "gemini-2.5-flash"))
 
 if not API_KEY:
     print("[hindsight-dev-server] ERROR: no LLM API key found "
-          "(set GEMINI_API_KEY or HINDSIGHT_API_LLM_API_KEY).", file=sys.stderr)
+          "(set GROQ_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY, or HINDSIGHT_API_LLM_API_KEY).", file=sys.stderr)
     sys.exit(1)
+
+# Hindsight reads service-tier defaults while importing its server package.
+# Set this before the import: its upstream default is "auto", which Groq rejects
+# for free/on-demand organizations.
+if PROVIDER == "groq" and not os.environ.get("HINDSIGHT_API_LLM_GROQ_SERVICE_TIER"):
+    os.environ["HINDSIGHT_API_LLM_GROQ_SERVICE_TIER"] = "on_demand"
+if PROVIDER == "groq" and not os.environ.get("HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS"):
+    # Hindsight 1.2 defaults to 64k; Groq's Qwen endpoint caps output at 16k.
+    # 8k remains comfortably above Hindsight's 3k retain chunk size.
+    os.environ["HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS"] = "8192"
 
 try:
     from hindsight import HindsightServer
@@ -80,6 +105,10 @@ _set_default("HINDSIGHT_API_REFLECT_LLM_TIMEOUT", "45")
 # Raise consolidation token budget so a 4096-cap fallback model doesn't truncate the
 # structured consolidation JSON (Hindsight issue #1939).
 _set_default("HINDSIGHT_API_CONSOLIDATION_MAX_TOKENS", "2048")
+# Hindsight 1.2 defaults Groq to service_tier="auto", which Groq rejects on
+# free/on-demand organizations. The ordinary on_demand tier works with the same
+# API key and preserves the provider fallback behavior.
+_set_default("HINDSIGHT_API_LLM_GROQ_SERVICE_TIER", "on_demand")
 
 
 def main():
