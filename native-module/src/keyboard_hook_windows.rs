@@ -57,15 +57,14 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::edit_shortcut::{windows_edit_key, FLAG_CTRL as EDIT_FLAG_CTRL};
 use crate::app_chord::{
     app_chords_from_inputs, match_app_chord, AppChord, AppChordInput, MOD_ALT, MOD_CTRL, MOD_SHIFT,
 };
+use crate::edit_shortcut::{windows_edit_key, FLAG_CTRL as EDIT_FLAG_CTRL};
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use once_cell::sync::Lazy;
@@ -76,19 +75,20 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetKeyState, GetKeyboardLayout, ToUnicodeEx, VIRTUAL_KEY, VK_CAPITAL,
+    GetKeyState, GetKeyboardLayout, SendInput, ToUnicodeEx, INPUT, INPUT_0, INPUT_KEYBOARD,
+    KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CAPITAL,
     VK_CONTROL, VK_LWIN, VK_MENU, VK_NUMLOCK, VK_RWIN, VK_SHIFT,
 };
 // HKL (keyboard layout handle) lives under TextServices, not KeyboardAndMouse.
 use windows::Win32::UI::TextServices::HKL;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetAncestor, GetForegroundWindow, GetMessageW,
-    GetWindowThreadProcessId, PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
-    TranslateMessage, UnhookWindowsHookEx, WindowFromPoint,
-    EVENT_SYSTEM_FOREGROUND, GA_ROOT, HHOOK, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
-    PM_NOREMOVE, WH_KEYBOARD_LL, WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT,
-    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_QUIT, WM_RBUTTONDOWN,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN,
+    GetWindowThreadProcessId, KillTimer, PeekMessageW, PostThreadMessageW, SetTimer,
+    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WindowFromPoint,
+    EVENT_SYSTEM_FOREGROUND, GA_ROOT, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
+    LLKHF_LOWER_IL_INJECTED, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    WINEVENT_OUTOFCONTEXT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_QUIT,
+    WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_USER, WM_XBUTTONDOWN,
 };
 
 // ─── napi objects shared with the macOS module's JS surface ──────────────────
@@ -141,6 +141,142 @@ pub struct CapturedKey {
 const MAC_FLAG_SHIFT: u32 = 1 << 17;
 const MAC_FLAG_CAPS: u32 = 1 << 16;
 
+const VK_LSHIFT_: u32 = 0xA0;
+const VK_RSHIFT_: u32 = 0xA1;
+const VK_LCONTROL_: u32 = 0xA2;
+const VK_RCONTROL_: u32 = 0xA3;
+const VK_LMENU_: u32 = 0xA4;
+const VK_RMENU_: u32 = 0xA5;
+const LLKHF_EXTENDED_MASK: u32 = 0x01;
+const CTRL_DEFER_MS: u32 = 45;
+const CTRL_DEFER_TIMER_ID: usize = 0x4E41_5443; // "NATC"
+const PENDING_CTRL_VALID: u64 = 1 << 63;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BufferedCtrl {
+    vk: u32,
+    scan: u32,
+    flags: u32,
+    tracked_vk: u32,
+}
+
+impl BufferedCtrl {
+    fn pack(self) -> u64 {
+        PENDING_CTRL_VALID
+            | u64::from(self.vk & 0xff)
+            | (u64::from(self.scan & 0xffff) << 8)
+            | (u64::from(self.flags & 0xff) << 24)
+            | (u64::from(self.tracked_vk & 0xff) << 32)
+    }
+
+    fn unpack(value: u64) -> Option<Self> {
+        if value & PENDING_CTRL_VALID == 0 {
+            return None;
+        }
+        Some(Self {
+            vk: (value & 0xff) as u32,
+            scan: ((value >> 8) & 0xffff) as u32,
+            flags: ((value >> 24) & 0xff) as u32,
+            tracked_vk: ((value >> 32) & 0xff) as u32,
+        })
+    }
+}
+
+fn is_control_vk(vk: u32) -> bool {
+    matches!(vk, 0x11 | VK_LCONTROL_ | VK_RCONTROL_)
+}
+
+fn is_modifier_vk(vk: u32) -> bool {
+    matches!(
+        vk,
+        0x10 | 0x11
+            | 0x12
+            | VK_LSHIFT_
+            | VK_RSHIFT_
+            | VK_LCONTROL_
+            | VK_RCONTROL_
+            | VK_LMENU_
+            | VK_RMENU_
+            | 0x5B
+            | 0x5C
+    )
+}
+
+/// Lock-free VK bitmap shared by the hook thread and lifecycle reset paths.
+/// SeqCst gives pressed and latch transitions one total order across teardown,
+/// focus changes, and hook callbacks.
+struct VkBitmap {
+    words: [AtomicU64; 4],
+}
+
+impl VkBitmap {
+    fn new() -> Self {
+        Self {
+            words: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+
+    /// Set/clear a VK and return its previous state.
+    fn transition(&self, vk: u32, down: bool) -> bool {
+        if vk >= 256 {
+            return false;
+        }
+        let word = (vk / 64) as usize;
+        let mask = 1u64 << (vk % 64);
+        let previous = if down {
+            self.words[word].fetch_or(mask, Ordering::SeqCst)
+        } else {
+            self.words[word].fetch_and(!mask, Ordering::SeqCst)
+        };
+        previous & mask != 0
+    }
+
+    fn contains(&self, vk: u32) -> bool {
+        if vk >= 256 {
+            return false;
+        }
+        let word = (vk / 64) as usize;
+        let mask = 1u64 << (vk % 64);
+        self.words[word].load(Ordering::SeqCst) & mask != 0
+    }
+
+    fn clear(&self) {
+        for word in &self.words {
+            word.store(0, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Normalize generic modifier VKs to physical left/right keys. The low-level
+/// hook supplies the extended flag for Ctrl/Alt and distinct scan codes for
+/// Shift, so releasing one side cannot clear the other side's held state.
+fn state_vk(vk: u32, scan: u32, flags: u32) -> u32 {
+    match vk {
+        0x10 => {
+            if scan == 0x36 {
+                VK_RSHIFT_
+            } else {
+                VK_LSHIFT_
+            }
+        }
+        0x11 => {
+            if flags & LLKHF_EXTENDED_MASK != 0 {
+                VK_RCONTROL_
+            } else {
+                VK_LCONTROL_
+            }
+        }
+        0x12 => {
+            if flags & LLKHF_EXTENDED_MASK != 0 {
+                VK_RMENU_
+            } else {
+                VK_LMENU_
+            }
+        }
+        _ => vk,
+    }
+}
+
 // ─── Shared hook state ───────────────────────────────────────────────────────
 
 struct HookState {
@@ -160,6 +296,9 @@ struct HookState {
     /// toggles because that thread pumps no keyboard input.
     caps_on: AtomicBool,
     num_on: AtomicBool,
+    /// Physical key state derived only from ordered hook transitions. This is
+    /// deliberately independent of GetAsyncKeyState snapshots.
+    pressed: VkBitmap,
     /// Threadsafe callback into V8. Set on start(), cleared on stop().
     callback: Mutex<Option<Arc<ThreadsafeFunction<CapturedKey>>>>,
     /// The app's supported Ctrl-based global shortcuts the hook swallows
@@ -167,11 +306,19 @@ struct HookState {
     /// empty ⟹ the feature is inert and every chord passes through exactly as
     /// before. See app_chord.rs for why and the scope.
     app_chords: Mutex<Vec<AppChord>>,
-    /// Completing-key VKs whose key-DOWN we swallowed as an app chord, so we can
-    /// also swallow the matching key-UP (never leak half a sequence). Keyed by
-    /// VK alone: the modifiers may already be released by the time the up
-    /// arrives.
-    swallowed_ups: Mutex<HashSet<u32>>,
+    /// Completing-key VKs whose initial DOWN was intercepted. Every repeat and
+    /// the final UP stay suppressed even after the modifier is released.
+    latched: VkBitmap,
+    /// One physical Control-down held for the short chord-disambiguation
+    /// window. Packed into one atomic so the hook, timer message, focus hook,
+    /// and teardown paths observe an indivisible event without allocation.
+    pending_ctrl: AtomicU64,
+    /// Actual identifier returned by SetTimer. With a null HWND Windows may
+    /// replace the requested ID, so WM_TIMER and KillTimer must use this value.
+    ctrl_timer_id: AtomicU64,
+    /// Physical left/right Control keys whose DOWN was discarded as part of an
+    /// intercepted chord. Their repeats and final UP must also be swallowed.
+    ctrl_latched: VkBitmap,
     /// Shortcut-guard mode. When true the hook does NOT swallow ordinary typing
     /// (everything passes straight through to the foreground app) and installs
     /// neither the mouse nor the foreground-change hook — its ONLY job is to
@@ -190,11 +337,91 @@ impl HookState {
             session_id: AtomicU64::new(0),
             caps_on: AtomicBool::new(false),
             num_on: AtomicBool::new(false),
+            pressed: VkBitmap::new(),
             callback: Mutex::new(None),
             app_chords: Mutex::new(Vec::new()),
-            swallowed_ups: Mutex::new(HashSet::new()),
+            latched: VkBitmap::new(),
+            pending_ctrl: AtomicU64::new(0),
+            ctrl_timer_id: AtomicU64::new(0),
+            ctrl_latched: VkBitmap::new(),
             shortcut_only: AtomicBool::new(false),
         }
+    }
+
+    fn ctrl_held(&self) -> bool {
+        self.pressed.contains(VK_LCONTROL_) || self.pressed.contains(VK_RCONTROL_)
+    }
+
+    fn alt_held(&self) -> bool {
+        self.pressed.contains(VK_LMENU_) || self.pressed.contains(VK_RMENU_)
+    }
+
+    fn shift_held(&self) -> bool {
+        self.pressed.contains(VK_LSHIFT_) || self.pressed.contains(VK_RSHIFT_)
+    }
+
+    fn win_held(&self) -> bool {
+        self.pressed.contains(VK_LWIN.0 as u32) || self.pressed.contains(VK_RWIN.0 as u32)
+    }
+
+    fn has_app_chords(&self) -> bool {
+        !self
+            .app_chords
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty()
+    }
+
+    fn reset_key_tracking(&self) {
+        self.pressed.clear();
+        self.latched.clear();
+        self.pending_ctrl.store(0, Ordering::SeqCst);
+        self.ctrl_timer_id.store(0, Ordering::SeqCst);
+        self.ctrl_latched.clear();
+    }
+
+    fn buffer_ctrl(&self, event: BufferedCtrl) {
+        self.pending_ctrl.store(event.pack(), Ordering::SeqCst);
+    }
+
+    fn pending_ctrl(&self) -> Option<BufferedCtrl> {
+        BufferedCtrl::unpack(self.pending_ctrl.load(Ordering::SeqCst))
+    }
+
+    fn take_pending_ctrl(&self) -> Option<BufferedCtrl> {
+        BufferedCtrl::unpack(self.pending_ctrl.swap(0, Ordering::SeqCst))
+    }
+
+    fn cancel_ctrl_timer(&self) {
+        let timer_id = self.ctrl_timer_id.swap(0, Ordering::SeqCst) as usize;
+        if timer_id != 0 {
+            unsafe {
+                let _ = KillTimer(HWND::default(), timer_id);
+            }
+        }
+    }
+
+    fn discard_pending_ctrl_for_chord(&self) -> Option<BufferedCtrl> {
+        let pending = self.take_pending_ctrl()?;
+        self.cancel_ctrl_timer();
+        self.ctrl_latched.transition(pending.tracked_vk, true);
+        Some(pending)
+    }
+
+    fn consume_ctrl_latched_transition(&self, tracked_vk: u32, is_down: bool, is_up: bool) -> bool {
+        if is_down {
+            return self.ctrl_latched.contains(tracked_vk);
+        }
+        is_up && self.ctrl_latched.transition(tracked_vk, false)
+    }
+
+    /// Repeats remain latched. The first physical UP clears the latch while
+    /// still being consumed, so the next DOWN begins a fresh press cycle.
+    fn consume_latched_transition(&self, vk: u32, is_down: bool, is_up: bool) -> bool {
+        if is_down {
+            return self.latched.contains(vk);
+        }
+        is_up && self.latched.transition(vk, false)
     }
 }
 
@@ -203,17 +430,92 @@ impl HookState {
 /// thread just before installing the hook, cleared after it unhooks.
 static ACTIVE_HOOK: Lazy<Mutex<Option<Arc<HookState>>>> = Lazy::new(|| Mutex::new(None));
 
+fn injected_key_input(vk: u32, scan: u32, ll_flags: u32, key_up: bool) -> INPUT {
+    let mut flags = if ll_flags & LLKHF_EXTENDED_MASK != 0 {
+        KEYEVENTF_EXTENDEDKEY.0
+    } else {
+        0
+    };
+    if key_up {
+        flags |= KEYEVENTF_KEYUP.0;
+    }
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(vk as u16),
+                wScan: scan as u16,
+                dwFlags: KEYBD_EVENT_FLAGS(flags),
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+/// Re-inject a deferred Control-down after chord disambiguation. SendInput marks
+/// the event LLKHF_INJECTED, so the hook's injection bypass passes it directly
+/// downstream and cannot feed it back into this state machine.
+unsafe fn replay_ctrl_down(event: BufferedCtrl) -> bool {
+    let input = injected_key_input(event.vk, event.scan, event.flags, false);
+    SendInput(&[input], std::mem::size_of::<INPUT>() as i32) == 1
+}
+
+unsafe fn replay_ctrl_tap(state: &HookState) -> Option<bool> {
+    let event = state.take_pending_ctrl()?;
+    state.cancel_ctrl_timer();
+    let inputs = [
+        injected_key_input(event.vk, event.scan, event.flags, false),
+        injected_key_input(event.vk, event.scan, event.flags, true),
+    ];
+    Some(SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) == 2)
+}
+
+/// Replay Control and the ordinary completing key in one serialized input
+/// batch. Passing the original key after a standalone SendInput(Control) would
+/// not guarantee ordering inside the foreground queue.
+unsafe fn replay_ctrl_with_key_down(state: &HookState, key: &KBDLLHOOKSTRUCT) -> Option<bool> {
+    let event = state.take_pending_ctrl()?;
+    state.cancel_ctrl_timer();
+    let inputs = [
+        injected_key_input(event.vk, event.scan, event.flags, false),
+        injected_key_input(key.vkCode, key.scanCode, key.flags.0, false),
+    ];
+    Some(SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) == 2)
+}
+
+/// Resolve a pending Control-down as ordinary input. Safe to call repeatedly;
+/// only the atomic swap winner replays an event.
+unsafe fn flush_pending_ctrl(state: &HookState) -> bool {
+    let Some(event) = state.take_pending_ctrl() else {
+        return false;
+    };
+    state.cancel_ctrl_timer();
+    replay_ctrl_down(event)
+}
+
+/// Hold an initial physical Control-down for one short timer interval. The
+/// original hook event is always swallowed; if SetTimer fails, replay it
+/// immediately so ordinary Control use is never lost.
+unsafe fn defer_ctrl_down(state: &HookState, event: BufferedCtrl) {
+    // Preserve a rare second Control-side transition instead of overwriting it.
+    let _ = flush_pending_ctrl(state);
+    state.buffer_ctrl(event);
+    let timer_id = SetTimer(HWND::default(), CTRL_DEFER_TIMER_ID, CTRL_DEFER_MS, None);
+    if timer_id == 0 {
+        let _ = flush_pending_ctrl(state);
+    } else {
+        state.ctrl_timer_id.store(timer_id as u64, Ordering::SeqCst);
+    }
+}
+
 // ─── The low-level keyboard hook procedure ───────────────────────────────────
 //
 // Runs on the worker thread's message loop for every key event, system-wide.
 // Must return promptly (Windows drops slow LL hooks after LowLevelHooksTimeout,
 // ~300ms). We do no blocking work: the tsfn.call is non-blocking (queues onto
 // V8 and returns).
-unsafe extern "system" fn keyboard_hook_proc(
-    code: i32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // A panic crossing this `extern "system"` boundary aborts the process (since
     // Rust 1.81) — a hard kill from the OS input thread. Contain it and pass the
     // event through, mirroring keyboard_tap.rs. `pass_through` never swallows, so
@@ -265,14 +567,26 @@ unsafe fn keyboard_hook_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRES
     }
 
     let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+
+    // Never consume or re-dispatch synthetic input. Besides respecting assistive
+    // technology and automation, this prevents a future SendInput-based feature
+    // from feeding its own events back through the N-API callback indefinitely.
+    // LOWER_IL_INJECTED is normally accompanied by INJECTED; test both explicitly
+    // so the policy remains correct even for unusual third-party injectors.
+    if (kb.flags.0 & (LLKHF_INJECTED.0 | LLKHF_LOWER_IL_INJECTED.0)) != 0 {
+        return pass();
+    }
+
     let vk = kb.vkCode;
     let scan = kb.scanCode;
+    let tracked_vk = state_vk(vk, scan, kb.flags.0);
+    let was_down = state.pressed.transition(tracked_vk, is_key_down);
 
     // Keep our toggle state current. The lock keys are passed through below, but
     // we must observe their DOWN transition first — the worker thread's own
     // GetKeyState is unreliable for toggles (it pumps no keyboard input). A
     // single press flips the lock.
-    if is_key_down {
+    if is_key_down && !was_down {
         if vk == VK_CAPITAL.0 as u32 {
             state.caps_on.fetch_xor(true, Ordering::AcqRel);
         } else if vk == VK_NUMLOCK.0 as u32 {
@@ -287,10 +601,47 @@ unsafe fn keyboard_hook_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRES
     // released by the time the up arrives. Runs before the pass-through filter:
     // the completing key (Enter, a digit, a letter) would otherwise take the
     // deliver-to-overlay path on its own up.
-    if is_key_up {
-        let mut ups = state.swallowed_ups.lock().unwrap_or_else(|p| p.into_inner());
-        if ups.remove(&vk) {
+    if state.consume_latched_transition(vk, is_key_down, is_key_up) {
+        return LRESULT(1);
+    }
+
+    // Defer Control briefly so an app chord can consume the complete modifier
+    // stream instead of leaking a bare Ctrl transition to the focused app.
+    if is_control_vk(vk) {
+        if state.consume_ctrl_latched_transition(tracked_vk, is_key_down, is_key_up) {
             return LRESULT(1);
+        }
+
+        if is_key_down && !was_down && state.has_app_chords() {
+            defer_ctrl_down(
+                &state,
+                BufferedCtrl {
+                    vk,
+                    scan,
+                    flags: kb.flags.0,
+                    tracked_vk,
+                },
+            );
+            return LRESULT(1);
+        }
+
+        // Hide typematic repeats while unresolved. If Control is released
+        // without a chord, replay DOWN+UP as one ordered batch and swallow the
+        // original UP. A standalone SendInput(DOWN) followed by passing this
+        // already-in-flight hook event does not provide a queue-order guarantee.
+        if state.pending_ctrl().is_some() {
+            if is_key_down {
+                return LRESULT(1);
+            }
+            if is_key_up {
+                return match replay_ctrl_tap(&state) {
+                    Some(true) => LRESULT(1),
+                    // SendInput can be rejected by UIPI for a higher-integrity
+                    // foreground process. Preserve the physical release as the
+                    // least surprising best-effort fallback.
+                    Some(false) | None => pass(),
+                };
+            }
         }
     }
 
@@ -303,15 +654,15 @@ unsafe fn keyboard_hook_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRES
     // meeting app — the exact stealth leak this module prevents. So for AltGr we
     // resolve the character first and only pass through if it yields none (i.e.
     // it was a genuine Ctrl+Alt shortcut, which produces no text).
-    let ctrl = modifier_held(VK_CONTROL);
-    let alt = modifier_held(VK_MENU);
+    let ctrl = state.ctrl_held();
+    let alt = state.alt_held();
     // AltGr == Ctrl+Alt. On layouts that define AltGr, Windows injects a
     // synthetic Left-Ctrl alongside right-Alt, so (ctrl && alt) already catches
     // every real AltGr. Do NOT also test VK_RMENU: on US/UK layouts right-Alt is
     // a plain Alt (no synthetic Ctrl), and flagging it as AltGr would fabricate
     // a Ctrl in the key-state and split right- vs left-Alt shortcut handling.
     let altgr = ctrl && alt;
-    if win_held() {
+    if state.win_held() {
         return pass();
     }
 
@@ -327,7 +678,7 @@ unsafe fn keyboard_hook_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRES
     // through: an Alt chord with a printable completing key never matches.
     if is_key_down && ctrl {
         let mods = MOD_CTRL
-            | if modifier_held(VK_SHIFT) { MOD_SHIFT } else { 0 }
+            | if state.shift_held() { MOD_SHIFT } else { 0 }
             | if alt { MOD_ALT } else { 0 };
         let matched = {
             let chords = state.app_chords.lock().unwrap_or_else(|p| p.into_inner());
@@ -337,19 +688,46 @@ unsafe fn keyboard_hook_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRES
             // Deliver on the SAME threadsafe callback as ordinary keys, tagged
             // with the action id so StealthKeyboardManager dispatches it instead
             // of typing it into the overlay.
-            if let Some(swallowed) = deliver_and_swallow(&state, vk, CapturedKey {
-                key_code: 0,
-                chars: String::new(),
-                flags: 0,
-                is_key_down: true,
-                is_outside_mouse_down: false,
-                app_chord_id: id,
-            }) {
+            if let Some(swallowed) = deliver_and_swallow(
+                &state,
+                vk,
+                CapturedKey {
+                    key_code: 0,
+                    chars: String::new(),
+                    flags: 0,
+                    is_key_down: true,
+                    is_outside_mouse_down: false,
+                    app_chord_id: id,
+                },
+            ) {
+                // Delivery succeeded, so this is our chord. Discard the held
+                // Control DOWN and latch that physical side through its UP.
+                let _ = state.discard_pending_ctrl_for_chord();
                 return swallowed;
             }
             // No live callback ⟹ nowhere to dispatch. Fall through so the OS /
             // RegisterHotKey can still handle it — never swallow a key with
             // nowhere to go (same rule as the plain-typing path below).
+        }
+    }
+
+    // A real non-modifier that did not complete an app chord resolves Control
+    // as ordinary input immediately, before this event reaches the foreground.
+    // Modifier transitions may still be part of Ctrl+Shift/Alt chords, so the
+    // 45ms timer remains authoritative for those.
+    if state.pending_ctrl().is_some() && !is_modifier_vk(vk) {
+        if is_key_down {
+            return match replay_ctrl_with_key_down(&state, kb) {
+                // The injected key-down bypasses this state machine, so swallow
+                // the original event to avoid duplicate input.
+                Some(true) => LRESULT(1),
+                // UIPI may reject injection into an elevated foreground app.
+                // Pass the physical key as a best-effort fallback.
+                Some(false) | None => pass(),
+            };
+        }
+        if is_key_up {
+            let _ = flush_pending_ctrl(&state);
         }
     }
 
@@ -372,15 +750,19 @@ unsafe fn keyboard_hook_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRES
     // as Backspace (mac keycode 51) with the Ctrl flag, so the renderer deletes
     // the last word (windows_edit_key has the rules).
     if is_key_down {
-        if let Some((key_code, chars)) = windows_edit_key(vk, ctrl, alt, modifier_held(VK_SHIFT)) {
-            if let Some(swallowed) = deliver_and_swallow(&state, vk, CapturedKey {
-                key_code,
-                chars: chars.to_string(),
-                flags: EDIT_FLAG_CTRL,
-                is_key_down: true,
-                is_outside_mouse_down: false,
-                app_chord_id: String::new(),
-            }) {
+        if let Some((key_code, chars)) = windows_edit_key(vk, ctrl, alt, state.shift_held()) {
+            if let Some(swallowed) = deliver_and_swallow(
+                &state,
+                vk,
+                CapturedKey {
+                    key_code,
+                    chars: chars.to_string(),
+                    flags: EDIT_FLAG_CTRL,
+                    is_key_down: true,
+                    is_outside_mouse_down: false,
+                    app_chord_id: String::new(),
+                },
+            ) {
                 return swallowed;
             }
             // Nowhere to deliver: let the OS have it rather than lose it.
@@ -398,7 +780,7 @@ unsafe fn keyboard_hook_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRES
     // whose identity the renderer reads from `chars` instead of `keyCode`.
     let key_code = vk_to_mac_keycode(vk);
 
-    let shift = modifier_held(VK_SHIFT);
+    let shift = state.shift_held();
     let caps = state.caps_on.load(Ordering::Acquire);
     let num = state.num_on.load(Ordering::Acquire);
 
@@ -429,14 +811,17 @@ unsafe fn keyboard_hook_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRES
     // Send BOTH keydown and keyup (renderer filters on isKeyDown), matching the
     // macOS tap. If delivery could not even be attempted (no live callback),
     // DON'T swallow — a swallowed key with nowhere to go is lost input.
-    let delivered = send_payload(&state, CapturedKey {
-        key_code,
-        chars,
-        flags,
-        is_key_down,
-        is_outside_mouse_down: false,
-        app_chord_id: String::new(),
-    });
+    let delivered = send_payload(
+        &state,
+        CapturedKey {
+            key_code,
+            chars,
+            flags,
+            is_key_down,
+            is_outside_mouse_down: false,
+            app_chord_id: String::new(),
+        },
+    );
     if !delivered {
         return pass();
     }
@@ -612,6 +997,15 @@ unsafe fn foreground_event_inner(
     // app, and window_belongs_to_us(0) is false — so without this guard we'd
     // spuriously stop the session on those transitions.
     if hwnd.0 == 0 {
+        let state = ACTIVE_HOOK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(Arc::clone);
+        if let Some(state) = state {
+            let _ = flush_pending_ctrl(&state);
+            state.reset_key_tracking();
+        }
         return;
     }
     let state = {
@@ -630,6 +1024,13 @@ unsafe fn foreground_event_inner(
     // Still check ownership explicitly so activating a Natively window (e.g. the
     // launcher) doesn't end the session.
     if window_belongs_to_us(hwnd) {
+        return;
+    }
+    // The foreground left Natively. Any missing key-up during the transition
+    // must not leave a modifier or suppression latch stuck for the next app.
+    let _ = flush_pending_ctrl(&state);
+    state.reset_key_tracking();
+    if state.shortcut_only.load(Ordering::Acquire) {
         return;
     }
     send_payload(
@@ -679,23 +1080,8 @@ fn deliver_and_swallow(state: &HookState, vk: u32, payload: CapturedKey) -> Opti
     if !send_payload(state, payload) {
         return None;
     }
-    state.swallowed_ups.lock().unwrap_or_else(|p| p.into_inner()).insert(vk);
+    state.latched.transition(vk, true);
     Some(LRESULT(1))
-}
-
-#[inline]
-fn modifier_held(vk: VIRTUAL_KEY) -> bool {
-    // GetAsyncKeyState, NOT GetKeyState: this hook runs on a worker thread that
-    // never processes the key messages, so GetKeyState there is stale. The
-    // async (real-time hardware) state is set at the raw-input layer BEFORE the
-    // hook decides to swallow the key, so it correctly reflects held modifiers.
-    // High-order bit (0x8000) = currently down.
-    (unsafe { GetAsyncKeyState(vk.0 as i32) } as u16 & 0x8000) != 0
-}
-
-#[inline]
-fn win_held() -> bool {
-    modifier_held(VK_LWIN) || modifier_held(VK_RWIN)
 }
 
 /// VK codes we pass through untouched, matching the macOS whitelist intent.
@@ -707,11 +1093,10 @@ fn win_held() -> bool {
 /// own. On Windows there is no separate event type: pressing Alt arrives as an
 /// ordinary WM_KEYDOWN with vkCode = VK_MENU.
 ///
-/// The `modifier_held()` guard in the hook proc only catches keys pressed WHILE
-/// a modifier is already down; it cannot catch the modifier's OWN keydown,
-/// because a low-level hook runs before the system updates its key-state
-/// tables, so GetAsyncKeyState does not yet report that very key as down.
-/// Without the modifier VKs listed here, Alt/Ctrl/Shift/Win keydowns were
+/// Modifier transitions are recorded internally before this filter. The
+/// modifier events themselves must still pass through to Windows; otherwise
+/// the OS never receives the Ctrl/Alt/Shift/Win transition even though our
+/// state machine recorded it. Without the modifier VKs listed here, they were
 /// SWALLOWED — the OS never saw the modifier, so no combination could ever
 /// form. That broke every shortcut while stealth typing was engaged: the app's
 /// own Alt+H screenshot bind, and Windows' own Win-key shortcuts too.
@@ -802,7 +1187,7 @@ fn vk_to_mac_keycode(vk: u32) -> u32 {
 /// caller-supplied modifier/toggle state.
 ///
 /// We build the 256-byte key-state array from state the caller already computed
-/// (via GetAsyncKeyState for live presses and our own maintained toggle flags)
+/// (via ordered hook transitions and our own maintained toggle flags)
 /// rather than GetKeyboardState(), because a low-level hook runs outside the
 /// foreground input queue and GetKeyboardState there is unreliable.
 ///
@@ -897,6 +1282,14 @@ struct HookGuard {
 
 impl Drop for HookGuard {
     fn drop(&mut self) {
+        // Teardown can race the 45ms disambiguation window. Resolve a pending
+        // physical Control-down on its owning message-loop thread before the
+        // hook disappears; otherwise stop() would silently eat that transition.
+        unsafe {
+            let _ = flush_pending_ctrl(&self.state);
+        }
+        self.state.cancel_ctrl_timer();
+        self.state.reset_key_tracking();
         unsafe {
             let _ = UnhookWindowsHookEx(self.kb);
             if let Some(m) = self.mouse {
@@ -996,7 +1389,9 @@ fn hook_worker(state: Arc<HookState>, session_id: u64, ready_tx: mpsc::Sender<bo
         // Low-level MOUSE hook for outside-click stop. If it fails, keyboard
         // stealth still works; the user just loses click-away auto-stop (Esc /
         // idle / hotkey still disengage).
-        guard.mouse = match unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), hmod, 0) } {
+        guard.mouse = match unsafe {
+            SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), hmod, 0)
+        } {
             Ok(h) => Some(h),
             Err(e) => {
                 eprintln!("[keyboard_hook_windows] WH_MOUSE_LL install failed (outside-click stop disabled): {e:?}");
@@ -1007,20 +1402,24 @@ fn hook_worker(state: Arc<HookState>, session_id: u64, ready_tx: mpsc::Sender<bo
         // Foreground-change hook: stops the session on Alt+Tab / Win+Tab / any
         // app switch without a click. NON-FATAL. hmod must be NULL for an
         // out-of-context WinEvent hook.
-        guard.fg = unsafe {
-            SetWinEventHook(
-                EVENT_SYSTEM_FOREGROUND,
-                EVENT_SYSTEM_FOREGROUND,
-                HMODULE::default(),
-                Some(foreground_event_proc),
-                0, // all processes
-                0, // all threads
-                WINEVENT_OUTOFCONTEXT,
-            )
-        };
-        if guard.fg.0 == 0 {
-            eprintln!("[keyboard_hook_windows] SetWinEventHook failed (Alt+Tab auto-stop disabled)");
-        }
+    }
+
+    // Always observe foreground changes. Full stealth mode uses them to stop
+    // capture; shortcut-only mode uses them solely as an OS-desync boundary
+    // that clears pressed/latch state without disabling the guard.
+    guard.fg = unsafe {
+        SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            HMODULE::default(),
+            Some(foreground_event_proc),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        )
+    };
+    if guard.fg.0 == 0 {
+        eprintln!("[keyboard_hook_windows] SetWinEventHook failed (focus reset / Alt+Tab auto-stop disabled)");
     }
 
     // The queue was already forced at the top of this function; the hooks are
@@ -1033,6 +1432,14 @@ fn hook_worker(state: Arc<HookState>, session_id: u64, ready_tx: mpsc::Sender<bo
         let r = unsafe { GetMessageW(&mut msg, HWND::default(), 0, 0) };
         if r.0 <= 0 {
             break;
+        }
+        if msg.message == WM_TIMER
+            && state.ctrl_timer_id.load(Ordering::SeqCst) == msg.wParam.0 as u64
+        {
+            unsafe {
+                let _ = flush_pending_ctrl(&state);
+            }
+            continue;
         }
         unsafe {
             let _ = TranslateMessage(&msg);
@@ -1143,10 +1550,15 @@ impl StealthKeyboardTap {
         // Publish the mode + chord table BEFORE the worker installs the hook, so
         // the very first keystroke already sees them. Also clear any stale
         // swallowed-up tracking from a prior session.
-        self.state.shortcut_only.store(shortcut_only, Ordering::Release);
-        *self.state.app_chords.lock().unwrap_or_else(|p| p.into_inner()) =
-            app_chords_from_inputs(app_chords);
-        self.state.swallowed_ups.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        self.state
+            .shortcut_only
+            .store(shortcut_only, Ordering::Release);
+        *self
+            .state
+            .app_chords
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = app_chords_from_inputs(app_chords);
+        self.state.reset_key_tracking();
 
         // Join any prior worker still winding down before publishing active,
         // so its cleanup store(false) can't race our store(true).
@@ -1156,24 +1568,34 @@ impl StealthKeyboardTap {
         }
 
         self.state.active.store(true, Ordering::Release);
-        *self.state.callback.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(callback));
+        *self
+            .state
+            .callback
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(callback));
 
         // New session id. The worker captures it and only tears down shared
         // state if it is still current — so a worker detached on a timeout can't
         // clobber a newer session. fetch_add returns the previous value; +1 is
         // this session's id.
-        let session_id = self.state.session_id.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        let session_id = self
+            .state
+            .session_id
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
 
         // Seed the CapsLock / NumLock toggle state HERE, on the JS main thread,
         // which pumps input so GetKeyState reports the true toggle. The worker
         // thread cannot read this reliably (it pumps no keyboard input); the
         // hook then keeps it current by flipping on each lock-key press.
-        self.state
-            .caps_on
-            .store((unsafe { GetKeyState(VK_CAPITAL.0 as i32) } & 0x0001) != 0, Ordering::Release);
-        self.state
-            .num_on
-            .store((unsafe { GetKeyState(VK_NUMLOCK.0 as i32) } & 0x0001) != 0, Ordering::Release);
+        self.state.caps_on.store(
+            (unsafe { GetKeyState(VK_CAPITAL.0 as i32) } & 0x0001) != 0,
+            Ordering::Release,
+        );
+        self.state.num_on.store(
+            (unsafe { GetKeyState(VK_NUMLOCK.0 as i32) } & 0x0001) != 0,
+            Ordering::Release,
+        );
 
         // Confirm the hook actually installs before reporting success. Without
         // this, start() returns true the moment the thread spawns, so a hook
@@ -1187,7 +1609,11 @@ impl StealthKeyboardTap {
             .spawn(move || hook_worker(state, session_id, ready_tx))
             .map_err(|e| {
                 self.state.active.store(false, Ordering::Release);
-                *self.state.callback.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                *self
+                    .state
+                    .callback
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = None;
                 Error::new(
                     Status::GenericFailure,
                     format!("failed to spawn keyboard-hook worker: {e}"),
@@ -1206,7 +1632,11 @@ impl StealthKeyboardTap {
                 // Worker reported an install failure and has already returned.
                 self.state.active.store(false, Ordering::Release);
                 let _ = handle.join();
-                *self.state.callback.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                *self
+                    .state
+                    .callback
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = None;
                 Ok(false)
             }
             Err(_) => {
@@ -1220,7 +1650,11 @@ impl StealthKeyboardTap {
                     }
                 }
                 drop(handle);
-                *self.state.callback.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                *self
+                    .state
+                    .callback
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = None;
                 Ok(false)
             }
         }
@@ -1234,7 +1668,8 @@ impl StealthKeyboardTap {
     /// next keystroke reaches the foreground app normally.
     #[napi]
     pub fn stop(&self) {
-        if !self.state.active.swap(false, Ordering::AcqRel) {
+        let was_active = self.state.active.swap(false, Ordering::AcqRel);
+        if !was_active {
             return;
         }
         // Wake the worker's GetMessageW loop so it unhooks and exits.
@@ -1245,7 +1680,11 @@ impl StealthKeyboardTap {
             }
         }
         // Drop the JS callback so V8 can GC it.
-        *self.state.callback.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        *self
+            .state
+            .callback
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
 
         // Wait for the worker to finish unhooking (so a fast start() after this
         // installs cleanly and the WM_KEYBOARD_LL hook is provably removed).
@@ -1271,5 +1710,85 @@ impl StealthKeyboardTap {
 impl Default for StealthKeyboardTap {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{state_vk, BufferedCtrl, HookState, VK_LCONTROL_, VK_RCONTROL_};
+
+    #[test]
+    fn generic_control_is_normalized_by_extended_flag() {
+        assert_eq!(state_vk(0x11, 0x1d, 0), VK_LCONTROL_);
+        assert_eq!(state_vk(0x11, 0x1d, 0x01), VK_RCONTROL_);
+    }
+
+    #[test]
+    fn modifier_state_follows_ordered_transitions() {
+        let state = HookState::new();
+        assert!(!state.ctrl_held());
+        assert!(!state.pressed.transition(VK_LCONTROL_, true));
+        assert!(state.ctrl_held());
+        assert!(state.pressed.transition(VK_LCONTROL_, false));
+        assert!(!state.ctrl_held());
+    }
+
+    #[test]
+    fn latch_consumes_repeats_and_exactly_one_release() {
+        let state = HookState::new();
+        const VK_B: u32 = 0x42;
+        assert!(!state.consume_latched_transition(VK_B, true, false));
+        assert!(!state.latched.transition(VK_B, true));
+        assert!(state.consume_latched_transition(VK_B, true, false));
+        assert!(state.consume_latched_transition(VK_B, false, true));
+        assert!(!state.consume_latched_transition(VK_B, false, true));
+    }
+
+    #[test]
+    fn buffered_control_round_trips_without_allocation() {
+        let event = BufferedCtrl {
+            vk: 0x11,
+            scan: 0x1d,
+            flags: 0x01,
+            tracked_vk: VK_RCONTROL_,
+        };
+        assert_eq!(BufferedCtrl::unpack(event.pack()), Some(event));
+        assert_eq!(BufferedCtrl::unpack(0), None);
+    }
+
+    #[test]
+    fn intercepted_chord_latches_control_repeats_and_release() {
+        let state = HookState::new();
+        state.buffer_ctrl(BufferedCtrl {
+            vk: 0x11,
+            scan: 0x1d,
+            flags: 0,
+            tracked_vk: VK_LCONTROL_,
+        });
+        assert!(state.pending_ctrl().is_some());
+        assert!(state.discard_pending_ctrl_for_chord().is_some());
+        assert!(state.pending_ctrl().is_none());
+        assert!(state.consume_ctrl_latched_transition(VK_LCONTROL_, true, false));
+        assert!(state.consume_ctrl_latched_transition(VK_LCONTROL_, false, true));
+        assert!(!state.consume_ctrl_latched_transition(VK_LCONTROL_, false, true));
+    }
+
+    #[test]
+    fn lifecycle_reset_clears_pressed_and_latched_state() {
+        let state = HookState::new();
+        state.pressed.transition(VK_LCONTROL_, true);
+        state.latched.transition(0x42, true);
+        state.buffer_ctrl(BufferedCtrl {
+            vk: 0x11,
+            scan: 0x1d,
+            flags: 0,
+            tracked_vk: VK_LCONTROL_,
+        });
+        state.ctrl_latched.transition(VK_LCONTROL_, true);
+        state.reset_key_tracking();
+        assert!(!state.ctrl_held());
+        assert!(!state.consume_latched_transition(0x42, true, false));
+        assert!(state.pending_ctrl().is_none());
+        assert!(!state.consume_ctrl_latched_transition(VK_LCONTROL_, true, false));
     }
 }

@@ -12,6 +12,10 @@ import { isRegisterableAccelerator, probeAccelerator } from './acceleratorValida
 import { buildChordTable, type Win32Chord } from './winChord';
 import { buildMacEditChordTable, type MacEditChord } from './macEditChord';
 import { SettingsManager } from './SettingsManager';
+import {
+    ShortcutDispatchBarrier,
+    type ShortcutDispatchSource,
+} from './shortcutDispatchBarrier';
 
 export interface KeybindConfig {
     id: string;
@@ -88,6 +92,10 @@ export class KeybindManager {
     private windowHelper: any; // Type avoided for circular dep, passed in init
     private onUpdateCallbacks: (() => void)[] = [];
     private onShortcutTriggeredCallbacks: ((actionId: string) => void)[] = [];
+    // RegisterHotKey and the native WH_KEYBOARD_LL callback both marshal onto
+    // this main event loop. Keeping their barrier here gives one deterministic
+    // ordering point without blocking the native hook thread.
+    private readonly shortcutDispatchBarrier = new ShortcutDispatchBarrier();
     private activeMode: 'launcher' | 'overlay' = 'launcher';
     private healthCheckTimer: NodeJS.Timeout | null = null;
     // Ids whose globalShortcut.register() call did not take. Kept as state
@@ -226,11 +234,23 @@ export class KeybindManager {
      * the chord fires the action instead of leaking into the foreground app).
      * Guarded to global binds only — the hook is never given non-global ids, but
      * this keeps a stray id from dispatching an unexpected action. RegisterHotKey
-     * never double-fires because the hook swallowed the key before the OS saw it.
+     * The cross-source barrier below is still authoritative: a rare OS race can
+     * enqueue RegisterHotKey just before the low-level hook swallows the key.
      */
     public triggerActionById(actionId: string): void {
         const kb = this.keybinds.get(actionId);
         if (!kb || !kb.isGlobal) return;
+        this.dispatchShortcut(actionId, 'native-hook');
+    }
+
+    private dispatchShortcut(actionId: string, source: ShortcutDispatchSource): void {
+        if (!this.shortcutDispatchBarrier.accept(actionId, source)) {
+            console.debug('[KeybindManager] Suppressed duplicate shortcut dispatch', {
+                actionId,
+                source,
+            });
+            return;
+        }
         this.onShortcutTriggeredCallbacks.forEach(cb => cb(actionId));
     }
 
@@ -470,7 +490,7 @@ export class KeybindManager {
                 }
                 try {
                     globalShortcut.register(acc, () => {
-                        this.onShortcutTriggeredCallbacks.forEach(cb => cb(kb.id));
+                        this.dispatchShortcut(kb.id, 'register-hotkey');
                     });
                     if (globalShortcut.isRegistered(acc)) {
                         console.log(`[KeybindManager] Registered global shortcut: ${acc} -> ${kb.id}`);
@@ -598,7 +618,7 @@ export class KeybindManager {
             lost++;
             try {
                 globalShortcut.register(acc, () => {
-                    this.onShortcutTriggeredCallbacks.forEach(cb => cb(kb.id));
+                    this.dispatchShortcut(kb.id, 'register-hotkey');
                 });
                 if (globalShortcut.isRegistered(acc)) {
                     recovered++;

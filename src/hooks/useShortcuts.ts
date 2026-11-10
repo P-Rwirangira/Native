@@ -157,8 +157,9 @@ export const useShortcuts = () => {
     // Track shortcuts the OS/another app is refusing to hand over, so
     // Settings can flag them instead of leaving a silently dead hotkey.
     useEffect(() => {
-        if (!window.electronAPI?.onKeybindRegistrationFailed) return;
-        const unsubscribe = window.electronAPI.onKeybindRegistrationFailed(({ id }) => {
+        const api = window.electronAPI;
+        if (!api?.onKeybindRegistrationFailed) return;
+        const unsubscribe = api.onKeybindRegistrationFailed(({ id }) => {
             const action = BACKEND_ID_TO_ACTION[id];
             if (!action) return;
             pushSettledRef.current.add(action);
@@ -176,8 +177,9 @@ export const useShortcuts = () => {
     // after the user records a new combo for it, or when the health check
     // recovers a combo whose thief has since quit).
     useEffect(() => {
-        if (!window.electronAPI?.onKeybindRegistrationSucceeded) return;
-        const unsubscribe = window.electronAPI.onKeybindRegistrationSucceeded(({ id }) => {
+        const api = window.electronAPI;
+        if (!api?.onKeybindRegistrationSucceeded) return;
+        const unsubscribe = api.onKeybindRegistrationSucceeded(({ id }) => {
             const action = BACKEND_ID_TO_ACTION[id];
             if (!action) return;
             pushSettledRef.current.add(action);
@@ -201,12 +203,13 @@ export const useShortcuts = () => {
     // snapshot the badges only ever appeared after the user edited some
     // unrelated shortcut and incidentally triggered a full re-registration.
     useEffect(() => {
-        if (!window.electronAPI?.getKeybindRegistrationFailures) return;
+        const api = window.electronAPI;
+        if (!api?.getKeybindRegistrationFailures) return;
         let cancelled = false;
 
         (async () => {
             try {
-                const failures = await window.electronAPI.getKeybindRegistrationFailures();
+                const failures = await api.getKeybindRegistrationFailures();
                 if (cancelled) return;
                 setConflicts(prev => {
                     const next = new Set(prev);
@@ -232,8 +235,10 @@ export const useShortcuts = () => {
     // reports as in effect.
     const [globalShortcutsEnabled, setGlobalShortcutsEnabledState] = useState(true);
     useEffect(() => {
+        const api = window.electronAPI;
+        if (!api?.getGlobalShortcutsEnabled) return;
         let cancelled = false;
-        window.electronAPI.getGlobalShortcutsEnabled?.()
+        api.getGlobalShortcutsEnabled()
             .then((enabled) => { if (!cancelled && typeof enabled === 'boolean') setGlobalShortcutsEnabledState(enabled); })
             .catch((error) => console.error('Failed to fetch global shortcut setting:', error));
         return () => { cancelled = true; };
@@ -242,7 +247,9 @@ export const useShortcuts = () => {
     const setGlobalShortcutsEnabled = useCallback(async (enabled: boolean) => {
         setGlobalShortcutsEnabledState(enabled);
         try {
-            const effective = await window.electronAPI.setGlobalShortcutsEnabled(enabled);
+            const api = window.electronAPI;
+            if (!api?.setGlobalShortcutsEnabled) throw new Error('Electron preload bridge is unavailable');
+            const effective = await api.setGlobalShortcutsEnabled(enabled);
             if (typeof effective === 'boolean') setGlobalShortcutsEnabledState(effective);
         } catch (error) {
             console.error('Failed to set global shortcut setting:', error);
@@ -252,9 +259,12 @@ export const useShortcuts = () => {
 
     // Load from Main Process on mount
     useEffect(() => {
+        const api = window.electronAPI;
+        if (!api?.getKeybinds || !api?.onKeybindsUpdate) return;
+
         const fetchKeybinds = async () => {
             try {
-                const keybinds = await window.electronAPI.getKeybinds();
+                const keybinds = await api.getKeybinds();
                 mapBackendToFrontend(keybinds);
             } catch (error) {
                 console.error('Failed to fetch keybinds:', error);
@@ -264,7 +274,7 @@ export const useShortcuts = () => {
         fetchKeybinds();
 
         // Listen for updates
-        const unsubscribe = window.electronAPI.onKeybindsUpdate((keybinds) => {
+        const unsubscribe = api.onKeybindsUpdate((keybinds) => {
             mapBackendToFrontend(keybinds);
         });
 
@@ -328,7 +338,9 @@ export const useShortcuts = () => {
 
         if (backendId) {
             try {
-                await window.electronAPI.setKeybind(backendId, accelerator);
+                const api = window.electronAPI;
+                if (!api?.setKeybind) throw new Error('Electron preload bridge is unavailable');
+                await api.setKeybind(backendId, accelerator);
             } catch (error) {
                 console.error(`Failed to set keybind for ${actionId}:`, error);
             }
@@ -338,7 +350,9 @@ export const useShortcuts = () => {
     // Function to reset all shortcuts to defaults
     const resetShortcuts = useCallback(async () => {
         try {
-            const defaults = await window.electronAPI.resetKeybinds();
+            const api = window.electronAPI;
+            if (!api?.resetKeybinds) throw new Error('Electron preload bridge is unavailable');
+            const defaults = await api.resetKeybinds();
             mapBackendToFrontend(defaults);
             setGlobalShortcutsEnabledState(true);
         } catch (error) {
